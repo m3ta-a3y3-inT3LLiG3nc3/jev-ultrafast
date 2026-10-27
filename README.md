@@ -67,6 +67,10 @@ Chrome connects through [Browser Harness](https://github.com/browser-use/browser
 
 `TEXT_MODEL_API_KEY` is an OpenRouter key in the example configuration. The current demo uses `inception/mercury-2.5` with reasoning disabled. Gemini, GLM, and DeepSeek can also use the OpenAI-compatible text helper; configure the appropriate model, endpoint, and reasoning setting.
 
+## Local backend (no TypeSafe key)
+
+Set `JEV_BACKEND=openai` to answer the operation/target choice heads with any OpenAI-compatible endpoint instead of TypeSafe. Defaults: `ACTION_MODEL_BASE_URL=http://127.0.0.1:11434/v1` (Ollama) and `ACTION_MODEL=m3ta/qwen3-abl-8b-nothink-32k`. Each head is asked separately with a JSON schema whose `choice` is an enum of the allowed options; anything outside it is rejected before an action runs. Probabilities are one-hot unless the endpoint returns usable logprobs. Expect lower accuracy than hosted Jev. `JEV_BACKEND=typesafe` remains the default.
+
 ## Use the library
 
 ```python

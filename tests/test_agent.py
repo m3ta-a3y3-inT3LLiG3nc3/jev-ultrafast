@@ -318,3 +318,71 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+def test_typesafe_danger_zone_headers(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_DANGER_ZONE_IMAGES", raising=False)
+    monkeypatch.delenv("TYPESAFE_DANGER_ZONE_LONG_CONTEXT", raising=False)
+    assert model.typesafe_headers("https://api.typesafe.ai/v1/systemone") == {}
+    monkeypatch.setenv("TYPESAFE_DANGER_ZONE_IMAGES", "true")
+    assert model.typesafe_headers("https://api.typesafe.ai/v1/systemone") == {"TypeSafe-Danger-Zone-Images": "true"}
+    assert model.typesafe_headers("https://openrouter.ai/api/v1/chat/completions") == {}
+
+
+def _openai_reply(selected, logprobs=None):
+    msg = {"choices": [{"message": {"content": json.dumps({"choice": selected})}}]}
+    if logprobs is not None:
+        msg["choices"][0]["logprobs"] = {"content": logprobs}
+    return msg
+
+
+def test_openai_backend_uses_local_endpoint_and_matches_choose_shape(monkeypatch):
+    calls = []
+
+    def post(url, key, body):
+        calls.append((url, body))
+        ids = body["response_format"]["json_schema"]["schema"]["properties"]["choice"]["enum"]
+        return _openai_reply("TYPE_TEXT" if "TYPE_TEXT" in ids else "1")
+
+    monkeypatch.setenv("JEV_BACKEND", "openai")
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("ACTION_MODEL_BASE_URL", raising=False)
+    monkeypatch.delenv("ACTION_MODEL", raising=False)
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(page(), "Find a book", [])
+    assert d["choice"] == "e1" and d["operation"] == "TYPE_TEXT" and d["target"] == "1"
+    assert d["confidence"] == 1.0 and d["probabilities"] == {"e1": 1.0}
+    assert all(u == "http://127.0.0.1:11434/v1/chat/completions" for u, _ in calls)
+    assert calls[0][1]["model"] == "m3ta/qwen3-abl-8b-nothink-32k"
+    assert len(calls) == 2  # operation head + only the selected target head
+
+
+def test_openai_backend_rejects_option_outside_enum(monkeypatch):
+    monkeypatch.setenv("JEV_BACKEND", "openai")
+    monkeypatch.setattr(model, "post_json", lambda *_: _openai_reply("HACK"))
+    with pytest.raises(ValueError):
+        model.choose(page(), "Find a book", [])
+
+
+def test_openai_backend_soft_probabilities_from_logprobs(monkeypatch):
+    lp = [{"token": "DONE", "logprob": -0.1, "top_logprobs": [
+        {"token": "DONE", "logprob": -0.1}, {"token": "BLOCKED", "logprob": -2.5}]}]
+    monkeypatch.setenv("JEV_BACKEND", "openai")
+    monkeypatch.setattr(model, "post_json", lambda *_: _openai_reply("DONE", lp))
+    d = model.choose(page(), "Find a book", [])
+    assert d["choice"] == "DONE" and 0.5 < d["confidence"] < 1.0
+    assert abs(sum(d["operation_probabilities"].values()) - 1) < 1e-6
+
+
+def test_default_backend_is_still_typesafe(monkeypatch):
+    urls = []
+
+    def post(url, _key, body):
+        urls.append(url)
+        return {"model": "t", "answers": {"operation": choice(body["questions"]["operation"]["criteria"], "DONE")}}
+
+    monkeypatch.delenv("JEV_BACKEND", raising=False)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    assert model.choose(page(), "x", [])["choice"] == "DONE"
+    assert urls == ["https://api.typesafe.ai/v1/systemone"]
