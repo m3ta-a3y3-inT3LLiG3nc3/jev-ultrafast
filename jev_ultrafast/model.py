@@ -12,10 +12,23 @@ from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 CLIENT = httpx.Client(http2=True, timeout=25)
 
 
+def typesafe_headers(url):
+    """Opt-in TypeSafe danger-zone headers (TYPESAFE_DANGER_ZONE_IMAGES / _LONG_CONTEXT=true)."""
+    if not url.startswith("https://api.typesafe.ai/"):
+        return {}
+    headers = {}
+    if os.environ.get("TYPESAFE_DANGER_ZONE_IMAGES", "").lower() == "true":
+        headers["TypeSafe-Danger-Zone-Images"] = "true"
+    if os.environ.get("TYPESAFE_DANGER_ZONE_LONG_CONTEXT", "").lower() == "true":
+        headers["TypeSafe-Danger-Zone-Long-Context"] = "true"
+    return headers
+
+
 def post_json(url, key, body):
+    headers = {"Authorization": f"Bearer {key}", **typesafe_headers(url)}
     for attempt in range(3):
         try:
-            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+            response = CLIENT.post(url, json=body, headers=headers)
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
@@ -116,7 +129,10 @@ def choose(state, goal, history):
         "questions": questions,
     }
     started = time.perf_counter()
-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    if os.environ.get("JEV_BACKEND", "typesafe").lower() == "openai":
+        result = choose_openai(body)
+    else:
+        result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
@@ -146,6 +162,82 @@ def choose(state, goal, history):
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "request": body,
     }
+
+
+def _answer_openai(base, key, model, state, name, question):
+    ids = list(question["criteria"])
+    prompt = {
+        "state": state,
+        "question": name,
+        "instructions": question.get("instructions", {}),
+        "options": question["criteria"],
+        "reply": 'JSON object {"choice": "<one option id>"} using exactly one of: ' + ", ".join(ids),
+    }
+    result = post_json(
+        base + "/chat/completions",
+        key,
+        {
+            "model": model,
+            "temperature": 0,
+            "max_tokens": 64,
+            "logprobs": True,
+            "top_logprobs": 20,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "choice",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"choice": {"type": "string", "enum": ids}},
+                        "required": ["choice"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "messages": [
+                {"role": "system", "content": "Pick exactly one option. Answer only with the JSON object."},
+                {"role": "user", "content": json.dumps(prompt)},
+            ],
+        },
+    )
+    try:
+        message = result["choices"][0]["message"]["content"]
+        choice = str(json.loads(message)["choice"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise ValueError("Invalid local model response; no action executed.") from None
+    if choice not in ids:
+        raise ValueError("Local model chose an unknown option; no action executed.")
+    probabilities = {i: 0.0 for i in ids}
+    probabilities[choice] = 1.0
+    # If logprobs are available, use the first token where options diverge for a soft distribution.
+    try:
+        for token in result["choices"][0]["logprobs"]["content"]:
+            alts = {t["token"].strip('" '): math.exp(t["logprob"]) for t in token.get("top_logprobs", [])}
+            hits = {i: sum(p for tok, p in alts.items() if tok and i.startswith(tok)) for i in ids}
+            if choice.startswith(token["token"].strip('" ')) and token["token"].strip('" ') and sum(hits.values()) > 0:
+                total = sum(hits.values())
+                soft = {i: hits[i] / total for i in ids}
+                if soft[choice] >= max(soft.values()) - 1e-6:
+                    probabilities = soft
+                break
+    except (KeyError, TypeError, ValueError, IndexError):
+        pass
+    return {"choice": choice, "probabilities": probabilities, "confidence": probabilities[choice]}
+
+
+def choose_openai(body):
+    """Answer TypeSafe-style questions with a local OpenAI-compatible model (e.g. Ollama)."""
+    base = os.environ.get("ACTION_MODEL_BASE_URL", "http://127.0.0.1:11434/v1").rstrip("/")
+    model = os.environ.get("ACTION_MODEL", "m3ta/qwen3-abl-8b-nothink-32k")
+    key = os.environ.get("ACTION_MODEL_API_KEY", "ollama")
+    started = time.perf_counter()
+    answers = {"operation": _answer_openai(base, key, model, body["state"], "operation", body["questions"]["operation"])}
+    operation = answers["operation"]["choice"]
+    head = operation.lower() + "_target"
+    if head in body["questions"]:
+        answers[head] = _answer_openai(base, key, model, body["state"], head, body["questions"][head])
+    return {"answers": answers, "model": model, "usage": {"latency_ms": round((time.perf_counter() - started) * 1000)}}
 
 
 def field_context(goal, action, page, history):
